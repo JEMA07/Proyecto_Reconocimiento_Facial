@@ -1,0 +1,8 @@
+opencv-python
+numpy
+pandas
+mtcnn
+tensorflow
+keras
+face-recognition
+scikit-learn
