@@ -1,3 +1,4 @@
+# ·train_model_v1.py· 
 import os
 import csv
 import cv2
@@ -35,7 +36,7 @@ def load_model(model_path: Path):
     return known_encodings, known_names
 
 def load_students(csv_path: Path):
-    print("📚 Cargando base de datos de estudiantes...")
+    print(" Cargando base de datos de estudiantes...")
     students_info = {}
     with open(csv_path, newline="", encoding="utf-8") as csvfile:
         reader = csv.DictReader(csvfile)
