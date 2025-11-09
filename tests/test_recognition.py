@@ -24,7 +24,7 @@ known_names = list(data["names"])
 print(f"Modelo cargado con {len(known_names)} rostros registrados.\n")
 
 # === Cargar información de los estudiantes ===
-print("cv📚 Cargando base de datos de estudiantes...")
+print("cv Cargando base de datos de estudiantes...")
 students_info = {}
 with open(CSV_PATH, newline='', encoding='utf-8') as csvfile:
     reader = csv.DictReader(csvfile)
