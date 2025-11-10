@@ -1,5 +1,4 @@
 from __future__ import annotations
-# Asegurar import de 'src' cuando se ejecuta con streamlit run
 from pathlib import Path
 import sys, time
 ROOT = Path(__file__).resolve().parents[2]
@@ -17,20 +16,30 @@ from src.panel.control import start_worker, stop_worker, get_pid
 
 PIDFILE = RUN_DIR / "vision.pid"
 
-# ---------------- Config de página ----------------
 st.set_page_config(page_title=APP_TITLE, layout="wide", page_icon="🧠")
 
-# ---------------- Sidebar ----------------
+# CSS global para responsive suave
+st.markdown("""
+<style>
+@media (max-width: 768px) {
+  section.main .block-container { padding-left: 0.6rem; padding-right: 0.6rem; }
+  h1, .stMarkdown h1 { font-size: 1.6rem !important; }
+  .stMetric { text-align: center; }
+}
+[data-testid="stVerticalBlock"] { gap: 0.5rem; }
+</style>
+""", unsafe_allow_html=True)
+
+# Sidebar
 if LOGO.exists():
     st.sidebar.image(str(LOGO), width=140)
 st.sidebar.title("Controles")
 
-# PIN de operador
 pin_ok = st.session_state.get("pin_ok", False)
 if not pin_ok:
     pin = st.sidebar.text_input("PIN de operador", type="password", placeholder="****")
     if st.sidebar.button("Validar PIN"):
-        if pin == "1234":  # cambia este PIN
+        if pin == "1234":  # cambia el PIN
             st.session_state["pin_ok"] = True
             pin_ok = True
             st.sidebar.success("PIN válido")
@@ -43,7 +52,7 @@ ref_ms = st.sidebar.slider("Refresco (ms)", 500, 5000, REFRESH_MS_DEFAULT, 100)
 modo_silencioso = st.sidebar.toggle("Modo silencioso", value=True)
 st.sidebar.caption("La voz/alarma se controla desde el proceso de visión.")
 
-# Botonera de control del reconocimiento
+# Control del worker
 st.sidebar.subheader("Servicio de reconocimiento")
 pid_actual = get_pid(PIDFILE)
 col_a, col_b = st.sidebar.columns(2)
@@ -60,27 +69,26 @@ if col_b.button("Detener", disabled=not pin_ok or pid_actual is None):
     else:
         st.sidebar.error("No se pudo detener. Verifica permisos.")
 
-# Estado
+# Mostrar estado (sin ternario que imprime objetos)
 pid_actual = get_pid(PIDFILE)
 if pid_actual:
     st.sidebar.info(f"Estado: RUNNING (PID {pid_actual})")
 else:
     st.sidebar.warning("Estado: STOPPED")
 
-# ---------------- Encabezado ----------------
+# Encabezado
 st.title(APP_TITLE)
 st.caption(APP_SUBTITLE)
 
-# ---------------- Layout principal ----------------
+# KPIs
 top_kpis = st.container()
-col_izq, col_der = st.columns([2.2, 1.4], gap="large")
+col_izq, col_der = st.columns([1.6, 1.4], gap="large")
 
 def render_once():
     df = leer_eventos(EVENTS_CSV)
     df_hoy = eventos_hoy(df)
     m = metricas(df_hoy)
 
-    # KPIs
     with top_kpis:
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Eventos hoy", m["total"])
@@ -88,18 +96,31 @@ def render_once():
         k3.metric("Identificados", m["identificados"])
         k4.metric("Último evento", m["ultimo_ts"].strftime("%H:%M:%S") if m["ultimo_ts"] else "—")
 
-    # En vivo
+    # En vivo con recuadro responsive
     with col_izq:
         st.subheader("En vivo")
         img = cargar_frame(LAST_FRAME)
         if img is not None:
-            st.image(img, channels="RGB", use_column_width=True)
+            st.image(img, channels="RGB", use_container_width=True)
+            st.markdown(
+                """
+                <style>
+                  [data-testid="stImage"] img {
+                    object-fit: cover;
+                    width: 100% !important;
+                    max-height: 420px;   /* altura del recuadro: ajusta 320–480 */
+                    border-radius: 10px;
+                  }
+                </style>
+                """,
+                unsafe_allow_html=True
+            )
         else:
             if pid_actual:
                 st.info("Sin frame aún... El worker está iniciando o no ha recibido video.")
             else:
                 st.info("Servicio detenido. Inicia el reconocimiento para ver el video.")
-        st.caption(f"Frame: {LAST_FRAME} | CSV: {EVENTS_CSV}")
+        st.caption(f"Frame: {LAST_FRAME.name} | CSV: {EVENTS_CSV.name}")
 
     # Ficha + recientes
     with col_der:
@@ -139,6 +160,4 @@ def render_once():
             st.success(f"Exportado: {out}")
 
 render_once()
-
-# Autorefresco ligero
 time.sleep(ref_ms / 1000.0)

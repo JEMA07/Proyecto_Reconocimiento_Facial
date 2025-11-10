@@ -6,13 +6,14 @@ import pandas as pd
 from PIL import Image
 import io
 
+COLUMNS = ["timestamp","cam_id","name","codigo","grado","distancia","decision","quality","snapshot_path"]
+
 def leer_eventos(csv_path: Path, max_rows: int = 5000) -> pd.DataFrame:
-    cols = ["timestamp","cam_id","name","codigo","grado","distancia","decision","quality","snapshot_path"]
     if not csv_path.exists():
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=COLUMNS)
     try:
         df = pd.read_csv(csv_path, encoding="utf-8")
-        for c in cols:
+        for c in COLUMNS:
             if c not in df.columns:
                 df[c] = None
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -21,17 +22,15 @@ def leer_eventos(csv_path: Path, max_rows: int = 5000) -> pd.DataFrame:
             df = df.tail(max_rows).copy()
         return df
     except Exception:
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=COLUMNS)
 
 def eventos_hoy(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "timestamp" not in df.columns:
-        return df
+    if df.empty or "timestamp" not in df.columns: return df
     hoy = date.today()
     return df[df["timestamp"].dt.date == hoy].copy()
 
 def ultimo_evento(df: pd.DataFrame) -> Optional[Dict]:
-    if df.empty:
-        return None
+    if df.empty: return None
     return df.iloc[-1].to_dict()
 
 def metricas(df: pd.DataFrame) -> Dict:
@@ -42,13 +41,11 @@ def metricas(df: pd.DataFrame) -> Dict:
     return {"total": total, "identificados": ident, "porc_ident": pct, "ultimo_ts": last_ts}
 
 def recientes(df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
-    if df.empty:
-        return df
+    if df.empty: return df
     return df.tail(n).iloc[::-1].copy()
 
 def cargar_frame(frame_path: Path):
-    if not frame_path.exists():
-        return None
+    if not frame_path.exists(): return None
     try:
         with frame_path.open("rb") as f:
             data = f.read()
