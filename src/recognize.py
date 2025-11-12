@@ -1,6 +1,5 @@
-import argparse, time, csv, os
+import argparse, time, csv, os, uuid
 from datetime import datetime
-from pathlib import Path
 from collections import deque, Counter
 
 import cv2
@@ -8,7 +7,8 @@ import numpy as np
 import face_recognition
 import pickle
 
-from src.config import LAST_FRAME, EVENTS_CSV, SNAP_DIR
+from src.config import LAST_FRAME, EVENTS_CSV, SNAP_DIR, RUN_DIR
+from src.capture_faces import open_any, read_loop  # capturador universal
 
 MODEL_PATH = os.path.join("models", "embeddings_mtcnn.pkl")
 if not os.path.exists(MODEL_PATH):
@@ -17,16 +17,20 @@ if not os.path.exists(MODEL_PATH):
 with open(MODEL_PATH, "rb") as f:
     data = pickle.load(f)
 
-known_encodings = data["encodings"]
-known_names = data["names"]
+known_encodings = data["encodings"]; known_names = data["names"]
 print(f"Base cargada con {len(known_names)} rostros registrados.")
 
-THRESH = 0.50
-MARGIN = 0.07
+THRESH = 0.50; MARGIN = 0.07
 DETECTOR_MODEL = "hog"
+VOTES_WINDOW = 7; VOTES_NEED = 5
+VERBOSE = True
 
-VOTES_WINDOW = 7
-VOTES_NEED = 5
+def log(msg):
+    if VERBOSE: print(msg)
+
+def write_status(text):
+    try: (RUN_DIR / "vision.status").write_text(str(text), encoding="utf-8")
+    except Exception: pass
 
 def ensure_csv_header():
     if not EVENTS_CSV.exists():
@@ -40,9 +44,45 @@ def append_event(cam_id, name, codigo, grado, distancia, decision, quality, snap
     with EVENTS_CSV.open("a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([ts, cam_id, name, codigo, grado, distancia, decision, quality, snapshot_path])
 
-def save_frame(frame_bgr):
-    LAST_FRAME.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(LAST_FRAME), frame_bgr)
+def save_frame_atomic(frame_bgr, path=LAST_FRAME):
+    dirp = LAST_FRAME.parent; dirp.mkdir(parents=True, exist_ok=True)
+    root, ext = os.path.splitext(str(LAST_FRAME)); ext = ext or ".jpg"
+    last = os.path.join(str(dirp), f"last_frame{ext}")
+    prev = os.path.join(str(dirp), f"last_frame_prev{ext}")
+    nextp = os.path.join(str(dirp), f"last_frame_next{ext}")
+
+    ok = cv2.imwrite(nextp, frame_bgr)
+    if not ok:
+        raise RuntimeError(f"cv2.imwrite falló: {nextp}")
+    time.sleep(0.01)
+
+    try:
+        if os.path.exists(last):
+            try:
+                if os.path.exists(prev):
+                    try: os.remove(prev)
+                    except: pass
+                os.replace(last, prev)
+            except PermissionError:
+                pass
+    except Exception:
+        pass
+
+    for _ in range(6):
+        try:
+            os.replace(nextp, last)
+            return
+        except PermissionError:
+            time.sleep(0.03)
+        except Exception:
+            break
+    try:
+        import shutil
+        shutil.copyfile(nextp, last)
+        try: os.remove(nextp)
+        except: pass
+    except Exception:
+        pass
 
 def save_snapshot(face_bgr, codigo="NA"):
     SNAP_DIR.mkdir(parents=True, exist_ok=True)
@@ -51,44 +91,86 @@ def save_snapshot(face_bgr, codigo="NA"):
     cv2.imwrite(str(path), face_bgr)
     return str(path)
 
-def detectar_camara(max_idx=4):
-    print("Buscando cámara activa...")
-    for i in range(max_idx):
-        cap = cv2.VideoCapture(i)
-        ok, _ = cap.read()
-        print(f"Índice {i}: {'OK' if ok else 'No frame'}")
-        cap.release()
-        if ok: return i
-    print("No se detectó cámara disponible.")
-    return None
+def _placeholder_frame():
+    frame_bgr = np.zeros((480, 640, 3), dtype=np.uint8)
+    frame_bgr[:] = (0, 140, 255)
+    cv2.putText(frame_bgr, "Sin señal de cámara", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (20,20,20), 2)
+    return frame_bgr
 
 def decidir_identidad(encoding):
     if len(known_encodings) == 0:
         return "Sujeto no identificado", None, 1.0
     distances = face_recognition.face_distance(known_encodings, encoding)
     order = np.argsort(distances)
-    best_idx = int(order[0])
-    best_dist = float(distances[best_idx])
+    best_idx = int(order[0]); best_dist = float(distances[best_idx])
     second_best = float(distances[order[1]]) if len(order) > 1 else 1.0
     if (best_dist <= THRESH) and ((second_best - best_dist) >= MARGIN):
         return known_names[best_idx], best_dist, second_best
     return "Sujeto no identificado", best_dist, second_best
 
-def loop_panel(cam_id=0, sleep_s=0.6):
+def loop_panel(cam_id=None, url=None, prefer="auto", sleep_s=0.7):
     recent_votes = deque(maxlen=VOTES_WINDOW)
     ensure_csv_header()
-    cap = cv2.VideoCapture(cam_id)
-    if not cap.isOpened():
-        print("No se pudo abrir la cámara en modo panel; escribiendo frame placeholder.")
-        frame_bgr = np.zeros((480, 640, 3), dtype=np.uint8); frame_bgr[:] = (0, 140, 255)
-        save_frame(frame_bgr); time.sleep(1.0)
 
-    while True:
-        ok, frame = cap.read()
-        if not ok or frame is None or frame.size == 0:
-            frame_bgr = np.zeros((480, 640, 3), dtype=np.uint8); frame_bgr[:] = (0, 140, 255)
-            cv2.putText(frame_bgr, "Sin señal de cámara", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (20,20,20), 2)
-            save_frame(frame_bgr); time.sleep(1.0); continue
+    preferred = [cam_id] if cam_id is not None else None
+    orig_url = url
+
+    open_url_first = (prefer == "url") or (prefer == "auto" and url)
+    open_local = (prefer == "local") or (prefer == "auto" and not url)
+
+    cam_sel, cap, be_name = None, None, ""
+    if open_url_first and url:
+        cam_sel, cap, be_name = open_any(url=url, prefer_w=640, prefer_h=480, preferred_indices=None, verbose=True)
+        if cap is None and prefer == "url":
+            log("[ERROR] URL falló en prefer='url'. Manteniendo placeholder.")
+            write_status("cam=None backend=None size=0x0")
+            while True:
+                save_frame_atomic(_placeholder_frame()); time.sleep(0.9)
+
+    if cap is None and open_local:
+        cam_sel, cap, be_name = open_any(url=None, prefer_w=640, prefer_h=480, preferred_indices=preferred, verbose=True)
+
+    if cap is None:
+        log("[WARN] Sin fuente de video: placeholder")
+        write_status("cam=None backend=None size=0x0")
+        while True:
+            save_frame_atomic(_placeholder_frame()); time.sleep(0.9)
+
+    if cam_sel is None and url:
+        reopen_args = (orig_url, 640, 480, None, 8, True)
+    else:
+        reopen_args = (None, 640, 480, [cam_sel], 8, True)
+
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    write_status(f"cam={cam_sel if cam_sel is not None else 'IP'} backend={be_name} size={w}x{h}")
+
+    for ok, frame in read_loop(cap, open_any, reopen_args, max_misses=15, delay_s=0.02, verbose=True):
+        if not ok:
+            log("[ERROR] Fuente perdida y no pudo reabrirse")
+            write_status("cam=None backend=None size=0x0")
+            save_frame_atomic(_placeholder_frame())
+            if prefer == "auto":
+                if cam_sel is None and open_local:
+                    cam_sel2, cap2, be2 = open_any(url=None, prefer_w=640, prefer_h=480, preferred_indices=preferred, verbose=True)
+                    if cap2 is not None:
+                        cam_sel, cap, be_name = cam_sel2, cap2, be2
+                        reopen_args = (None, 640, 480, [cam_sel], 8, True)
+                        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        write_status(f"cam={cam_sel} backend={be_name} size={w}x{h}")
+                        continue
+                elif cam_sel is not None and open_url_first and orig_url:
+                    cam_sel2, cap2, be2 = open_any(url=orig_url, prefer_w=640, prefer_h=480, preferred_indices=None, verbose=True)
+                    if cap2 is not None:
+                        cam_sel, cap, be_name = cam_sel2, cap2, be2
+                        reopen_args = (orig_url, 640, 480, None, 8, True)
+                        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        write_status(f"cam=IP backend={be_name} size={w}x{h}")
+                        continue
+            while True:
+                save_frame_atomic(_placeholder_frame()); time.sleep(0.9)
+
+        if frame is None or frame.size == 0:
+            save_frame_atomic(_placeholder_frame()); time.sleep(0.2); continue
 
         frame = cv2.convertScaleAbs(frame, alpha=1.15, beta=15)
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -99,11 +181,10 @@ def loop_panel(cam_id=0, sleep_s=0.6):
         had_faces = False
         for (encoding, loc) in zip(encodings, locations):
             had_faces = True
-            candidate, best_dist, second_best = decidir_identidad(encoding)
+            candidate, best_dist, _ = decidir_identidad(encoding)
 
             recent_votes.append(candidate)
             final_name, votes = Counter(recent_votes).most_common(1)[0]
-
             if final_name != "Sujeto no identificado" and votes >= VOTES_NEED:
                 shown_name = final_name; color = (0, 255, 0); decision = "accepted"
             else:
@@ -120,7 +201,7 @@ def loop_panel(cam_id=0, sleep_s=0.6):
             snap_path = save_snapshot(face_crop, codigo=shown_name) if face_crop is not None else ""
 
             quality = "high" if len(locations) <= 3 else "mid"
-            append_event(str(cam_id),
+            append_event(str(cam_sel if cam_sel is not None else 0),
                          name=shown_name if shown_name!="Sujeto no identificado" else "",
                          codigo=shown_name if shown_name!="Sujeto no identificado" else "",
                          grado="",
@@ -132,14 +213,26 @@ def loop_panel(cam_id=0, sleep_s=0.6):
         if not had_faces:
             cv2.putText(frame, "No se detecta ningún rostro", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
 
-        save_frame(frame)
+        save_frame_atomic(frame)
+        try:
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            write_status(f"cam={cam_sel if cam_sel is not None else 'IP'} backend={be_name} size={w}x{h}")
+        except Exception:
+            pass
+
         time.sleep(sleep_s)
 
-def loop_ui(cam_id=0):
-    recent_votes = deque(maxlen=VOTES_WINDOW)
+def loop_ui(cam_id=None, url=None, prefer="auto"):
     ensure_csv_header()
-    cap = cv2.VideoCapture(cam_id)
-    if not cap.isOpened(): raise RuntimeError("No se pudo abrir la cámara en modo UI.")
+    preferred = [cam_id] if cam_id is not None else None
+    cam_sel, cap, be_name = None, None, ""
+    if (prefer in ("url","auto")) and url:
+        cam_sel, cap, be_name = open_any(url=url, prefer_w=640, prefer_h=480, preferred_indices=None, verbose=True)
+    if cap is None and (prefer in ("local","auto")):
+        cam_sel, cap, be_name = open_any(url=None, prefer_w=640, prefer_h=480, preferred_indices=preferred, verbose=True)
+    if cap is None:
+        raise RuntimeError("No se pudo abrir ninguna fuente en modo UI.")
+    recent_votes = deque(maxlen=VOTES_WINDOW)
     while True:
         ok, frame = cap.read()
         if not ok: break
@@ -151,17 +244,15 @@ def loop_ui(cam_id=0):
             candidate, best_dist, _ = decidir_identidad(encoding)
             recent_votes.append(candidate)
             final_name, votes = Counter(recent_votes).most_common(1)[0]
-            if final_name != "Sujeto no identificado" and votes >= VOTES_NEED:
-                shown_name = final_name; color = (0,255,0)
-            else:
-                shown_name = "Sujeto no identificado"; color = (0,0,255)
+            color = (0,255,0) if (final_name!="Sujeto no identificado" and votes>=VOTES_NEED) else (0,0,255)
             top, right, bottom, left = loc
             cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-            cv2.putText(frame, shown_name, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            save_frame(frame)
+            cv2.putText(frame, final_name if color==(0,255,0) else "Sujeto no identificado", (left, top - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            save_frame_atomic(frame)
         if len(encodings) == 0:
             cv2.putText(frame, "No se detecta ningún rostro", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-            save_frame(frame)
+            save_frame_atomic(frame)
         cv2.imshow("Reconocimiento Facial Universal", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
     cap.release(); cv2.destroyAllWindows()
@@ -170,17 +261,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["panel","ui"], default="panel")
     ap.add_argument("--cam", type=int, default=None)
+    ap.add_argument("--url", type=str, default=os.getenv("CAM_URL", "").strip())
+    ap.add_argument("--prefer", choices=["auto","url","local"], default="auto")
     args = ap.parse_args()
 
-    cam_idx = args.cam if args.cam is not None else detectar_camara()
-    if cam_idx is None:
-        frame_bgr = np.zeros((480, 640, 3), dtype=np.uint8); frame_bgr[:] = (0, 140, 255)
-        save_frame(frame_bgr); print("Sin cámara; escrito frame placeholder."); time.sleep(2)
+    if args.url:
+        os.environ["CAM_URL"] = args.url
 
     if args.mode == "panel":
-        loop_panel(cam_id=cam_idx if cam_idx is not None else 0)
+        loop_panel(cam_id=args.cam, url=args.url, prefer=args.prefer)
     else:
-        loop_ui(cam_id=cam_idx if cam_idx is not None else 0)
+        loop_ui(cam_id=args.cam, url=args.url, prefer=args.prefer)
 
 if __name__ == "__main__":
     main()

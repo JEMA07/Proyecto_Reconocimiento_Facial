@@ -1,163 +1,207 @@
-from __future__ import annotations
-from pathlib import Path
-import sys, time
-ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
+import os, sys, time, pathlib, datetime, socket
 import streamlit as st
-from src.config import BASE_DIR, LOGS_DIR, SNAP_DIR, RUN_DIR, LAST_FRAME, EVENTS_CSV
-from src.panel.assets import APP_TITLE, APP_SUBTITLE, REFRESH_MS_DEFAULT, LOGO, DECISION_MARK
-from src.panel.helpers import (
-    leer_eventos, eventos_hoy, ultimo_evento, metricas, recientes,
-    cargar_frame, exportar_hoy, calidad_color
-)
+import pandas as pd
+
+from src.panel.assets import APP_TITLE, APP_SUBTITLE, REFRESH_MS_DEFAULT, LOGO
 from src.panel.control import start_worker, stop_worker, get_pid
+from src.panel.helpers import leer_eventos, recientes, ultimo_evento
 
-PIDFILE = RUN_DIR / "vision.pid"
+st.set_page_config(page_title="Neuromech Vision | Panel", page_icon="🧠", layout="wide")
 
-st.set_page_config(page_title=APP_TITLE, layout="wide", page_icon="🧠")
-
-# CSS global para responsive suave
-st.markdown("""
+THEME = """
 <style>
-@media (max-width: 768px) {
-  section.main .block-container { padding-left: 0.6rem; padding-right: 0.6rem; }
-  h1, .stMarkdown h1 { font-size: 1.6rem !important; }
-  .stMetric { text-align: center; }
-}
-[data-testid="stVerticalBlock"] { gap: 0.5rem; }
+:root { --bg:#0b0e12; --card:rgba(255,255,255,0.06); --border:rgba(255,255,255,0.12);
+        --text:#e8eef6; --muted:#9aa4b2; --ok:#22c55e; --danger:#ef4444; }
+.stApp { background: radial-gradient(1200px 600px at 10% -10%, #131a24 0%, #0b0e12 40%), var(--bg); color: var(--text); }
+.block-container { padding-top:.8rem; padding-bottom:2rem; }
+.card { background: linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03));
+        border:1px solid var(--border); border-radius:16px; padding:16px; }
+.badge { padding:4px 10px; border-radius:999px; font-size:.8rem; border:1px solid var(--border); }
+.live { background:#09351f; color:#34d399; border-color:#065f46; }
+.off  { background:#3f1d1d; color:#f87171; border-color:#7f1d1d; }
+.kpi { font-size:1.6rem; font-weight:800; }
+.kpi-label { font-size:.9rem; color:var(--muted); margin-top:-4px; }
+.timeline { display:flex; gap:12px; overflow-x:auto; padding: 6px 2px; }
+.tile { min-width:160px; background: var(--card); border:1px solid var(--border); border-radius:12px; padding:8px; }
+.tile img { border-radius:10px; border:1px solid var(--border); }
+.footer { color: var(--muted); font-size:.85rem; }
 </style>
-""", unsafe_allow_html=True)
+"""
+st.markdown(THEME, unsafe_allow_html=True)
+
+RUN_DIR = pathlib.Path("data/run")
+LAST = RUN_DIR / "last_frame.jpg"
+PREV = RUN_DIR / "last_frame_prev.jpg"
+STATUS = RUN_DIR / "vision.status"
+EVENTS = pathlib.Path("data/exports.csv")
+PIDFILE = RUN_DIR / "panel.pid"
+
+def read_status():
+    try: return STATUS.read_text(encoding="utf-8")
+    except: return "cam=None backend=None size=0x0"
+
+def parse_status(s: str):
+    parts = {k:v for k,v in (p.split("=",1) for p in s.split() if "=" in p)}
+    backend = parts.get("backend","-"); size = parts.get("size","-")
+    ok = (size not in ("0x0","-")) and (backend not in ("None","-"))
+    return ok, backend, size
+
+def get_frame_path():
+    for p in [LAST, PREV]:
+        if p.exists():
+            st_size = p.stat().st_size
+            age = time.time() - p.stat().st_mtime
+            if st_size >= 5000:
+                if age < 0.18: time.sleep(0.18)
+                return str(p)
+    return None
 
 # Sidebar
-if LOGO.exists():
-    st.sidebar.image(str(LOGO), width=140)
-st.sidebar.title("Controles")
+with st.sidebar:
+    st.markdown("### Neuromech Vision")
+    st.caption("Control de fuente y estado del productor")
+    prefer = st.radio("Estrategia", ["auto","url","local"], index=2, horizontal=True)
+    url = st.text_input("URL (si 'url' o 'auto')", os.getenv("CAM_URL","").strip(), placeholder="http://IP:4747/mjpegfeed?640x480")
+    cam = st.number_input("Índice cámara (si 'local' o 'auto')", min_value=0, step=1, value=2)
 
-pin_ok = st.session_state.get("pin_ok", False)
-if not pin_ok:
-    pin = st.sidebar.text_input("PIN de operador", type="password", placeholder="****")
-    if st.sidebar.button("Validar PIN"):
-        if pin == "1234":  # cambia el PIN
-            st.session_state["pin_ok"] = True
-            pin_ok = True
-            st.sidebar.success("PIN válido")
-        else:
-            st.sidebar.error("PIN incorrecto")
-else:
-    st.sidebar.caption("Operador autenticado")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("Aplicar", use_container_width=True):
+            stop_worker(PIDFILE); start_worker(PIDFILE, prefer=prefer, url=url, cam_idx=int(cam)); st.success("Productor aplicado")
+    with c2:
+        if st.button("Reiniciar", use_container_width=True):
+            stop_worker(PIDFILE); start_worker(PIDFILE, prefer=prefer, url=url, cam_idx=int(cam)); st.info("Productor reiniciado")
+    with c3:
+        if st.button("Detener", use_container_width=True):
+            stop_worker(PIDFILE); st.warning("Productor detenido")
 
-ref_ms = st.sidebar.slider("Refresco (ms)", 500, 5000, REFRESH_MS_DEFAULT, 100)
-modo_silencioso = st.sidebar.toggle("Modo silencioso", value=True)
-st.sidebar.caption("La voz/alarma se controla desde el proceso de visión.")
+# Autolanzar si no hay PID
+if not get_pid(PIDFILE):
+    start_worker(PIDFILE, prefer=prefer, url=url, cam_idx=int(cam))
 
-# Control del worker
-st.sidebar.subheader("Servicio de reconocimiento")
-pid_actual = get_pid(PIDFILE)
-col_a, col_b = st.sidebar.columns(2)
-if col_a.button("Iniciar", disabled=not pin_ok or pid_actual is not None):
-    pid = start_worker(PIDFILE, module="src.recognize")
-    if pid:
-        st.sidebar.success(f"Iniciado (PID {pid})")
-    else:
-        st.sidebar.error("No se pudo iniciar. Revisa logs del worker.")
+# Header
+col_logo, col_title = st.columns([1,6])
+with col_logo:
+    if LOGO.exists(): st.image(str(LOGO), width=56)
+with col_title:
+    st.markdown(f"## {APP_TITLE}")
+    st.caption(APP_SUBTITLE)
 
-if col_b.button("Detener", disabled=not pin_ok or pid_actual is None):
-    if stop_worker(PIDFILE):
-        st.sidebar.warning("Servicio detenido")
-    else:
-        st.sidebar.error("No se pudo detener. Verifica permisos.")
-
-# Mostrar estado (sin ternario que imprime objetos)
-pid_actual = get_pid(PIDFILE)
-if pid_actual:
-    st.sidebar.info(f"Estado: RUNNING (PID {pid_actual})")
-else:
-    st.sidebar.warning("Estado: STOPPED")
-
-# Encabezado
-st.title(APP_TITLE)
-st.caption(APP_SUBTITLE)
+ok, backend, size = parse_status(read_status())
 
 # KPIs
-top_kpis = st.container()
-col_izq, col_der = st.columns([1.6, 1.4], gap="large")
+def kpi_row():
+    col1, col2, col3, col4 = st.columns([1.3,1,1,1])
+    with col1:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown(f'<span class="badge {"live" if ok else "off"}>{"En vivo" if ok else "Sin señal"}</span>', unsafe_allow_html=True)
+        st.caption(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        st.markdown("</div>", unsafe_allow_html=True)
+    with col2:
+        st.markdown('<div class="card"><div class="kpi">{}</div><div class="kpi-label">Backend</div></div>'.format(backend), unsafe_allow_html=True)
+    with col3:
+        st.markdown('<div class="card"><div class="kpi">{}</div><div class="kpi-label">Resolución</div></div>'.format(size), unsafe_allow_html=True)
+    with col4:
+        host = socket.gethostbyname(socket.gethostname())
+        st.markdown('<div class="card"><div class="kpi">localhost</div><div class="kpi-label">URL: http://localhost:8581</div></div>', unsafe_allow_html=True)
+        st.caption(f"LAN: http://{host}:8581")
+kpi_row()
+st.divider()
 
-def render_once():
-    df = leer_eventos(EVENTS_CSV)
-    df_hoy = eventos_hoy(df)
-    m = metricas(df_hoy)
+# Tabs
+tab_live, tab_id, tab_events, tab_diag = st.tabs(["En vivo", "Identidad", "Eventos", "Diagnóstico"])
 
-    with top_kpis:
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Eventos hoy", m["total"])
-        k2.metric("% identificados", f"{m['porc_ident']}%")
-        k3.metric("Identificados", m["identificados"])
-        k4.metric("Último evento", m["ultimo_ts"].strftime("%H:%M:%S") if m["ultimo_ts"] else "—")
-
-    # En vivo con recuadro responsive
-    with col_izq:
-        st.subheader("En vivo")
-        img = cargar_frame(LAST_FRAME)
-        if img is not None:
-            st.image(img, channels="RGB", use_container_width=True)
-            st.markdown(
-                """
-                <style>
-                  [data-testid="stImage"] img {
-                    object-fit: cover;
-                    width: 100% !important;
-                    max-height: 420px;   /* altura del recuadro: ajusta 320–480 */
-                    border-radius: 10px;
-                  }
-                </style>
-                """,
-                unsafe_allow_html=True
-            )
+with tab_live:
+    col_live, col_side = st.columns([3.2,1.8])
+    with col_live:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        img_path = get_frame_path() if ok else None
+        if img_path: st.image(img_path, use_container_width=True)
+        else: st.info("Esperando frames del productor o revisa la fuente en la barra lateral.")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with col_side:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("#### Resumen instantáneo")
+        st.markdown(f'<span class="badge {"live" if ok else "off"}>{"En vivo" if ok else "Sin señal"}</span>', unsafe_allow_html=True)
+        st.write("Backend:", backend); st.write("Resolución:", size)
+        st.write("Hora:", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        st.markdown("</div>", unsafe_allow_html=True)
+        # Timeline simple
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("#### Últimos reconocidos")
+        df = leer_eventos(EVENTS)
+        if not df.empty:
+            rec = recientes(df, 8)
+            cA, cB = st.columns(2)
+            for i, row in rec.iterrows():
+                target = cA if (i % 2 == 0) else cB
+                with target:
+                    snap = row.get("snapshot_path","")
+                    if isinstance(snap,str) and len(snap)>0 and pathlib.Path(snap).exists():
+                        st.image(snap, use_container_width=True)
+                    nm = row.get("name","") or "Desconocido"
+                    dec = row.get("decision","rejected")
+                    st.write(nm, "🟢" if dec=="accepted" else "🔴")
+                    st.caption(str(row.get("timestamp","")))
         else:
-            if pid_actual:
-                st.info("Sin frame aún... El worker está iniciando o no ha recibido video.")
-            else:
-                st.info("Servicio detenido. Inicia el reconocimiento para ver el video.")
-        st.caption(f"Frame: {LAST_FRAME.name} | CSV: {EVENTS_CSV.name}")
+            st.caption("Aún no hay eventos.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    # Ficha + recientes
-    with col_der:
-        st.subheader("Ficha actual")
-        evt = ultimo_evento(df_hoy)
-        if evt:
-            nombre = evt.get("name", "—")
-            codigo = evt.get("codigo", "—")
-            grado  = evt.get("grado", "—")
-            dist   = evt.get("distancia", "—")
-            dec    = str(evt.get("decision", "—"))
-            qual   = str(evt.get("quality", "—"))
-            hora   = evt.get("timestamp").strftime("%H:%M:%S") if evt.get("timestamp") else "—"
-            marca  = DECISION_MARK.get(dec, "⚪")
-            st.markdown(f"**{marca} {nombre}**")
-            st.write(f"Código: {codigo} | Grado: {grado}")
-            st.write(f"Distancia: {dist} | Calidad: {calidad_color(qual)} | Hora: {hora}")
-            snap = evt.get("snapshot_path")
-            if snap and Path(snap).exists():
-                st.image(str(snap), caption="Snapshot", width=260)
-        else:
-            st.info("Sin eventos de hoy aún.")
+with tab_id:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("#### Identidad predominante")
+    df = leer_eventos(EVENTS)
+    last = ultimo_evento(df)
+    if last:
+        cols = st.columns([1.2,2])
+        with cols[0]:
+            sp = last.get("snapshot_path","")
+            if isinstance(sp,str) and len(sp)>0 and pathlib.Path(sp).exists():
+                st.image(sp, use_container_width=True)
+        with cols[1]:
+            nm = last.get("name","") or "Desconocido"
+            dec = last.get("decision","rejected")
+            st.markdown(f"### {nm} {'🟢' if dec=='accepted' else '🔴'}")
+            st.write("Código:", last.get("codigo",""))
+            st.write("Grado:", last.get("grado",""))
+            st.write("Confianza:", last.get("distancia",""))
+    else:
+        st.caption("Aún no hay identificaciones.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        st.divider()
-        st.subheader("Eventos recientes")
-        df_r = recientes(df_hoy, n=10)
-        if df_r.empty:
-            st.write("No hay eventos recientes.")
-        else:
-            mostrar = df_r[["timestamp","name","codigo","grado","distancia","decision","quality"]].copy()
-            mostrar["timestamp"] = mostrar["timestamp"].dt.strftime("%H:%M:%S")
-            st.dataframe(mostrar, use_container_width=True, hide_index=True)
+with tab_events:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("#### Eventos")
+    df = leer_eventos(EVENTS)
+    if not df.empty:
+        c1, c2, c3 = st.columns([2,1,1])
+        with c1:
+            q = st.text_input("Filtrar por nombre o código", "")
+            if q:
+                df = df[df["name"].fillna("").str.contains(q, case=False) | df["codigo"].fillna("").str.contains(q, case=False)]
+        with c2:
+            estado = st.selectbox("Estado", ["Todos","accepted","rejected"])
+            if estado != "Todos": df = df[df["decision"] == estado]
+        with c3:
+            quality = st.selectbox("Quality", ["Todas","high","mid"])
+            if quality != "Todas": df = df[df["quality"] == quality]
+        st.dataframe(df, use_container_width=True, height=420)
+        st.download_button("Descargar CSV", data=EVENTS.read_bytes(), file_name="events.csv", mime="text/csv", use_container_width=True)
+    else:
+        st.info("Aún no hay eventos.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        st.divider()
-        if st.button("Exportar CSV de hoy"):
-            out = exportar_hoy(df_hoy, LOGS_DIR / "exports")
-            st.success(f"Exportado: {out}")
+with tab_diag:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("#### Diagnóstico")
+    st.write("Run dir:", RUN_DIR.resolve())
+    st.write("PID productor:", get_pid(PIDFILE))
+    st.code(read_status())
+    st.write("Archivos:", str(LAST.resolve()), str(PREV.resolve()))
+    st.markdown("</div>", unsafe_allow_html=True)
 
-render_once()
-time.sleep(ref_ms / 1000.0)
+st.divider()
+st.markdown('<div class="footer">Neuromech Labs • Panel con Streamlit • Accede vía localhost; 0.0.0.0 es solo dirección de enlace.</div>', unsafe_allow_html=True)
+
+time.sleep(REFRESH_MS_DEFAULT/1000.0)
+st.rerun()

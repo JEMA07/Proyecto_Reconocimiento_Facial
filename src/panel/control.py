@@ -29,12 +29,39 @@ def get_pid(pidfile: Path) -> Optional[int]:
     if pidfile.exists(): pidfile.unlink(missing_ok=True)
     return None
 
-def start_worker(pidfile: Path, module: str = "src.recognize") -> Optional[int]:
+def _read_cam_idx(run_dir: Path) -> int:
+    p = run_dir / "cam_idx.txt"
+    if p.exists():
+        try: return int(p.read_text(encoding="utf-8").strip())
+        except: return 0
+    return 0
+
+def start_worker(pidfile: Path, module: str = "src.recognize",
+                 prefer: str = "local", url: str = "", cam_idx: int | None = None) -> Optional[int]:
+    """
+    Lanza el productor si no existe PID activo.
+    prefer: 'auto' | 'url' | 'local'
+    url: fuente de red, si aplica
+    cam_idx: índice de cámara local, si aplica
+    """
     existing = get_pid(pidfile)
     if existing: return existing
-    proc = subprocess.Popen([sys.executable, "-m", module, "--mode", "panel"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            creationflags=(subprocess.CREATE_NO_WINDOW if os.name=="nt" else 0))
+
+    run_dir = pidfile.parent
+    if cam_idx is None:
+        cam_idx = _read_cam_idx(run_dir)
+
+    args = [sys.executable, "-m", module, "--mode", "panel", "--prefer", prefer]
+    if prefer in ("url","auto") and url.strip():
+        args += ["--url", url.strip()]
+    if prefer in ("local","auto") and prefer != "url":
+        args += ["--cam", str(cam_idx)]
+
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=(subprocess.CREATE_NO_WINDOW if os.name=="nt" else 0)
+    )
     _write_pid(pidfile, proc.pid)
     time.sleep(0.8)
     if not _pid_alive(proc.pid):
