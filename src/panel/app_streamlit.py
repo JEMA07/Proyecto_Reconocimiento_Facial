@@ -30,8 +30,10 @@ THEME = """
 st.markdown(THEME, unsafe_allow_html=True)
 
 RUN_DIR = pathlib.Path("data/run")
-LAST = RUN_DIR / "last_frame.jpg"
-PREV = RUN_DIR / "last_frame_prev.jpg"
+# Usamos 'data' directamente en lugar de 'RUN_DIR' para las fotos
+LAST = pathlib.Path("data/last_frame.jpg")
+PREV = pathlib.Path("data/last_frame_prev.jpg")
+# -----------------------
 STATUS = RUN_DIR / "vision.status"
 EVENTS = pathlib.Path("data/exports.csv")
 PIDFILE = RUN_DIR / "panel.pid"
@@ -112,13 +114,30 @@ st.divider()
 tab_live, tab_id, tab_events, tab_diag = st.tabs(["En vivo", "Identidad", "Eventos", "Diagnóstico"])
 
 with tab_live:
-    col_live, col_side = st.columns([3.2,1.8])
+    col_live, col_side =st.columns([3.2,1.8])
     with col_live:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        img_path = get_frame_path() if ok else None
-        if img_path: st.image(img_path, use_container_width=True)
-        else: st.info("Esperando frames del productor o revisa la fuente en la barra lateral.")
+        st.markdown('<div class="card">',unsafe_allow_html=True)
+        #--- Inicio del cambio
+        image_data = None
+        if ok:
+            path_str =  get_frame_path()
+            if path_str:
+                try:
+                    # Al leer los bytes (.read_bytes()), Streamlit entiende que es 
+                    # una imagen NUEVA y la actualiza obligatoriamente.
+                    image_data = pathlib.Path(path_str).read_bytes()    
+                except Exception:
+                    # Si el archivo se está escribiendo justo ahora, ignoramos el error
+                    pass
+        if image_data:
+            st.image(image_data, use_container_width=True)
+        else:
+            st.info("Esperando frames del productor o revisa la fuente en la barra lateral.")
+        #--- Fin del cambio
         st.markdown("</div>", unsafe_allow_html=True)
+     
+     
+     
     with col_side:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("#### Resumen instantáneo")

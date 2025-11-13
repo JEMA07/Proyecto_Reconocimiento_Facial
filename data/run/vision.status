@@ -1,1 +1,1 @@
-cam=2 backend=DSHOW size=640x480
+cam=None backend=None size=0x0
