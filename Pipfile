@@ -12,6 +12,7 @@ tensorflow = "*"
 keras = "*"
 face-recognition = "*"
 scikit-learn = "*"
+ollama = "*"
 
 [dev-packages]
 
