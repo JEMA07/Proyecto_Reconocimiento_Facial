@@ -35,7 +35,7 @@ LAST = pathlib.Path("data/last_frame.jpg")
 PREV = pathlib.Path("data/last_frame_prev.jpg")
 # -----------------------
 STATUS = RUN_DIR / "vision.status"
-EVENTS = pathlib.Path("data/exports.csv")
+EVENTS = pathlib.Path("data/logs/events.csv")
 PIDFILE = RUN_DIR / "panel.pid"
 
 def read_status():
@@ -49,13 +49,28 @@ def parse_status(s: str):
     return ok, backend, size
 
 def get_frame_path():
+    # Intentamos leer LAST y luego PREV
     for p in [LAST, PREV]:
-        if p.exists():
-            st_size = p.stat().st_size
-            age = time.time() - p.stat().st_mtime
-            if st_size >= 5000:
-                if age < 0.18: time.sleep(0.18)
-                return str(p)
+        try:
+            # Verificamos existencia
+            if p.exists():
+                # --- ZONA DE RIESGO BLINDADA ---
+                # Si el archivo desaparece justo aquí, el 'try' capturará el error
+                stat = p.stat() 
+                st_size = stat.st_size
+                age = time.time() - stat.st_mtime
+                
+                # Si el archivo es válido (tiene tamaño y es reciente)
+                if st_size >= 5000:
+                    # Pequeña espera si es DEMASIADO nuevo para evitar lectura incompleta
+                    if age < 0.05: 
+                        time.sleep(0.05)
+                    return str(p)
+        except (FileNotFoundError, OSError, PermissionError):
+            # Si algo falla (archivo borrado o bloqueado), simplemente continuamos
+            # sin romper el programa.
+            continue
+            
     return None
 
 # Sidebar
